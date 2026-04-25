@@ -2,11 +2,12 @@ import os
 import copy
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from torchvision import transforms
+
 
 
 # =========================
@@ -38,22 +39,37 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Dataset
 # =========================
 class NPYDataset(Dataset):
-    def __init__(self, X, y=None):
-        """
-        X shape before: (N, 32, 32)
-        We convert it to: (N, 1, 32, 32)
-        """
-        self.X = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
-        self.y = None if y is None else torch.tensor(y, dtype=torch.long)
+    def __init__(self, X, y=None, augment=False):
+        self.X = X
+        self.y = y
+        self.augment = augment
+
+        self.augmentation = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.RandomAffine(
+                degrees=10,
+                translate=(0.08, 0.08),
+                scale=(0.9, 1.1)
+            ),
+            transforms.ToTensor()
+        ])
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        if self.y is None:
-            return self.X[idx]
-        return self.X[idx], self.y[idx]
+        image = self.X[idx]
 
+        if self.augment:
+            image = self.augmentation(image)
+        else:
+            image = torch.tensor(image, dtype=torch.float32).unsqueeze(0)
+
+        if self.y is None:
+            return image
+
+        label = torch.tensor(self.y[idx], dtype=torch.long)
+        return image, label
 
 # =========================
 # Model
@@ -200,9 +216,9 @@ def main():
     print(f"Val  : {X_val.shape}, {y_val.shape}")
 
     # Datasets
-    train_dataset = NPYDataset(X_tr, y_tr)
-    val_dataset = NPYDataset(X_val, y_val)
-    test_dataset = NPYDataset(X_test)
+    train_dataset = NPYDataset(X_tr, y_tr, augment=True)
+    val_dataset = NPYDataset(X_val, y_val, augment=False)
+    test_dataset = NPYDataset(X_test, augment=False)
 
     # DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
