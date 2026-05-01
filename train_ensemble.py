@@ -12,9 +12,6 @@ from torchvision import transforms
 from sklearn.model_selection import train_test_split
 
 
-# =========================
-# Config
-# =========================
 PROCESSED_DIR = os.path.join("data", "processed")
 OUTPUT_DIR = "outputs"
 
@@ -23,24 +20,21 @@ Y_TRAIN_PATH = os.path.join(PROCESSED_DIR, "y_train.npy")
 X_TEST_PATH = os.path.join(PROCESSED_DIR, "X_test.npy")
 TEST_IDS_PATH = os.path.join(PROCESSED_DIR, "test_ids.npy")
 
-MODEL_PATH = os.path.join(OUTPUT_DIR, "best_cnn.pt")
-SUBMISSION_PATH = os.path.join(OUTPUT_DIR, "submission.csv")
+SUBMISSION_PATH = os.path.join(OUTPUT_DIR, "submission_ensemble.csv")
 
 BATCH_SIZE = 64
-EPOCHS = 30
-PATIENCE = 6
+EPOCHS = 20
+PATIENCE = 5
 LEARNING_RATE = 0.001
 VALID_SIZE = 0.2
-RANDOM_STATE = 42
+
+SEEDS = [42, 123, 2026]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# =========================
-# Reproducibility
-# =========================
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -50,12 +44,6 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-set_seed(RANDOM_STATE)
-
-
-# =========================
-# Dataset
-# =========================
 class NPYDataset(Dataset):
     def __init__(self, X, y=None, augment=False):
         self.X = X
@@ -90,9 +78,6 @@ class NPYDataset(Dataset):
         return image, label
 
 
-# =========================
-# CNN Model
-# =========================
 class SimpleCNN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -101,17 +86,17 @@ class SimpleCNN(nn.Module):
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(32),
-            nn.MaxPool2d(2),  # 32x32 -> 16x16
+            nn.MaxPool2d(2),
 
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(64),
-            nn.MaxPool2d(2),  # 16x16 -> 8x8
+            nn.MaxPool2d(2),
 
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(128),
-            nn.MaxPool2d(2)   # 8x8 -> 4x4
+            nn.MaxPool2d(2)
         )
 
         self.classifier = nn.Sequential(
@@ -128,13 +113,10 @@ class SimpleCNN(nn.Module):
         return x
 
 
-# =========================
-# Train / Evaluate
-# =========================
 def train_one_epoch(model, loader, criterion, optimizer):
     model.train()
 
-    total_loss = 0.0
+    total_loss = 0
     correct = 0
     total = 0
 
@@ -143,7 +125,6 @@ def train_one_epoch(model, loader, criterion, optimizer):
         labels = labels.to(DEVICE)
 
         optimizer.zero_grad()
-
         outputs = model(images)
         loss = criterion(outputs, labels)
 
@@ -156,16 +137,13 @@ def train_one_epoch(model, loader, criterion, optimizer):
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
-    avg_loss = total_loss / total
-    accuracy = correct / total
-
-    return avg_loss, accuracy
+    return total_loss / total, correct / total
 
 
 def evaluate(model, loader, criterion):
     model.eval()
 
-    total_loss = 0.0
+    total_loss = 0
     correct = 0
     total = 0
 
@@ -183,90 +161,53 @@ def evaluate(model, loader, criterion):
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-    avg_loss = total_loss / total
-    accuracy = correct / total
-
-    return avg_loss, accuracy
+    return total_loss / total, correct / total
 
 
-def predict_test(model, loader):
+def predict_probabilities(model, loader):
     model.eval()
+    all_probs = []
 
-    all_preds = []
+    softmax = nn.Softmax(dim=1)
 
     with torch.no_grad():
         for images in loader:
             images = images.to(DEVICE)
-
             outputs = model(images)
-            preds = outputs.argmax(dim=1)
+            probs = softmax(outputs)
 
-            all_preds.extend(preds.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
 
-    return np.array(all_preds)
+    return np.vstack(all_probs)
 
 
-# =========================
-# Main
-# =========================
-def main():
-    print("=" * 60)
-    print("Loading processed data")
+def train_single_model(seed, X_train, y_train, X_test):
+    print("\n" + "=" * 60)
+    print(f"Training model with seed {seed}")
     print("=" * 60)
 
-    X_train = np.load(X_TRAIN_PATH)
-    y_train = np.load(Y_TRAIN_PATH)
-    X_test = np.load(X_TEST_PATH)
-    test_ids = np.load(TEST_IDS_PATH)
-
-    print(f"X_train shape: {X_train.shape}")
-    print(f"y_train shape: {y_train.shape}")
-    print(f"X_test shape : {X_test.shape}")
-    print(f"test_ids shape: {test_ids.shape}")
-    print(f"Using device: {DEVICE}")
+    set_seed(seed)
 
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train,
         y_train,
         test_size=VALID_SIZE,
-        random_state=RANDOM_STATE,
+        random_state=seed,
         stratify=y_train
     )
-
-    print("\nAfter split:")
-    print(f"Train: {X_tr.shape}, {y_tr.shape}")
-    print(f"Val  : {X_val.shape}, {y_val.shape}")
 
     train_dataset = NPYDataset(X_tr, y_tr, augment=True)
     val_dataset = NPYDataset(X_val, y_val, augment=False)
     test_dataset = NPYDataset(X_test, augment=False)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False
-    )
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     model = SimpleCNN().to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -275,72 +216,78 @@ def main():
         patience=2
     )
 
-    best_val_acc = 0.0
-    best_model_weights = copy.deepcopy(model.state_dict())
+    best_val_acc = 0
+    best_weights = copy.deepcopy(model.state_dict())
     epochs_without_improvement = 0
 
-    print("\n" + "=" * 60)
-    print("Start training")
-    print("=" * 60)
-
     for epoch in range(EPOCHS):
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        train_loss, train_acc = train_one_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer
-        )
-
-        val_loss, val_acc = evaluate(
-            model,
-            val_loader,
-            criterion
-        )
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_acc = evaluate(model, val_loader, criterion)
 
         scheduler.step(val_loss)
 
         print(
-            f"Epoch [{epoch + 1}/{EPOCHS}] | "
-            f"LR: {current_lr:.6f} | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            f"Seed {seed} | Epoch [{epoch + 1}/{EPOCHS}] | "
+            f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}"
         )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            best_weights = copy.deepcopy(model.state_dict())
             epochs_without_improvement = 0
-
-            best_model_weights = copy.deepcopy(model.state_dict())
-            torch.save(best_model_weights, MODEL_PATH)
-
-            print(f"  -> Best model saved to {MODEL_PATH}")
         else:
             epochs_without_improvement += 1
-            print(f"  -> No improvement for {epochs_without_improvement} epoch(s)")
 
         if epochs_without_improvement >= PATIENCE:
-            print(f"\nEarly stopping at epoch {epoch + 1}")
+            print(f"Early stopping for seed {seed} at epoch {epoch + 1}")
             break
 
-    print("\nTraining finished.")
-    print(f"Best validation accuracy: {best_val_acc:.4f}")
+    model.load_state_dict(best_weights)
 
-    model.load_state_dict(best_model_weights)
+    model_path = os.path.join(OUTPUT_DIR, f"best_cnn_seed_{seed}.pt")
+    torch.save(best_weights, model_path)
 
-    print("\nPredicting test set...")
-    test_preds = predict_test(model, test_loader)
+    print(f"Best val acc for seed {seed}: {best_val_acc:.4f}")
+    print(f"Saved model: {model_path}")
+
+    test_probs = predict_probabilities(model, test_loader)
+
+    return test_probs, best_val_acc
+
+
+def main():
+    print("Loading data...")
+    X_train = np.load(X_TRAIN_PATH)
+    y_train = np.load(Y_TRAIN_PATH)
+    X_test = np.load(X_TEST_PATH)
+    test_ids = np.load(TEST_IDS_PATH)
+
+    print(f"Using device: {DEVICE}")
+
+    all_test_probs = []
+    val_scores = []
+
+    for seed in SEEDS:
+        test_probs, val_acc = train_single_model(seed, X_train, y_train, X_test)
+        all_test_probs.append(test_probs)
+        val_scores.append(val_acc)
+
+    mean_probs = np.mean(all_test_probs, axis=0)
+    final_preds = np.argmax(mean_probs, axis=1)
 
     submission = pd.DataFrame({
         "Id": test_ids,
-        "Category": test_preds
+        "Category": final_preds
     })
 
     submission.to_csv(SUBMISSION_PATH, index=False)
 
+    print("\n" + "=" * 60)
+    print("Ensemble finished")
+    print("=" * 60)
+    print(f"Validation scores: {val_scores}")
+    print(f"Average validation accuracy: {np.mean(val_scores):.4f}")
     print(f"Submission saved to: {SUBMISSION_PATH}")
-    print("\nDone.")
 
 
 if __name__ == "__main__":
