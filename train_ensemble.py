@@ -28,9 +28,11 @@ PATIENCE = 5
 LEARNING_RATE = 0.001
 VALID_SIZE = 0.2
 
+SPLIT_SEED = 42
 SEEDS = [42, 123, 2026]
-
+LABEL_SMOOTHING = 0.1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HAS_ELASTIC = hasattr(transforms, "ElasticTransform")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -57,7 +59,8 @@ class NPYDataset(Dataset):
                 translate=(0.08, 0.08),
                 scale=(0.9, 1.1)
             ),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            make_elastic_transform(alpha=20.0, sigma=4.0)
         ])
 
     def __len__(self):
@@ -192,7 +195,7 @@ def train_single_model(seed, X_train, y_train, X_test):
         X_train,
         y_train,
         test_size=VALID_SIZE,
-        random_state=seed,
+        random_state=SPLIT_SEED,
         stratify=y_train
     )
 
@@ -206,7 +209,7 @@ def train_single_model(seed, X_train, y_train, X_test):
 
     model = SimpleCNN().to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -289,6 +292,53 @@ def main():
     print(f"Average validation accuracy: {np.mean(val_scores):.4f}")
     print(f"Submission saved to: {SUBMISSION_PATH}")
 
+
+def make_elastic_transform(alpha=20.0, sigma=4.0):
+    """Build an elastic deformation transform.
+    If the installed torchvision has transforms.ElasticTransform (>=0.13),
+    use it directly. Otherwise fall back to a hand-rolled implementation
+    that does the same thing (gaussian-smoothed displacement field +
+    grid_sample to warp the image).
+    """
+    if HAS_ELASTIC:
+        return transforms.ElasticTransform(alpha=alpha, sigma=sigma)
+    # Fallback: a callable that takes a CxHxW float tensor and returns one.
+    import torch.nn.functional as F
+    class _Elastic:
+        def __init__(self, alpha, sigma):
+            self.alpha = alpha
+            self.sigma = sigma
+        def __call__(self, img):
+            # img shape: (C, H, W)
+            c, h, w = img.shape
+            # Random displacement field, then gaussian-smooth it
+            dx = torch.randn(1, 1, h, w) * self.alpha
+            dy = torch.randn(1, 1, h, w) * self.alpha
+            # Gaussian blur via separable conv
+            ks = max(3, int(self.sigma * 4) | 1)  # odd kernel size
+            xs = torch.arange(ks, dtype=torch.float32) - ks // 2
+            g = torch.exp(-(xs ** 2) / (2 * self.sigma ** 2))
+            g = (g / g.sum()).view(1, 1, 1, ks)
+            dx = F.conv2d(dx, g, padding=(0, ks // 2))
+            dx = F.conv2d(dx, g.transpose(2, 3), padding=(ks // 2, 0))
+            dy = F.conv2d(dy, g, padding=(0, ks // 2))
+            dy = F.conv2d(dy, g.transpose(2, 3), padding=(ks // 2, 0))
+            # Build the sampling grid
+            yy, xx = torch.meshgrid(
+                torch.linspace(-1, 1, h),
+                torch.linspace(-1, 1, w),
+                indexing="ij",
+            )
+            grid = torch.stack(
+                (xx + dx[0, 0] * (2.0 / w), yy + dy[0, 0] * (2.0 / h)),
+                dim=-1,
+            ).unsqueeze(0)
+            warped = F.grid_sample(
+                img.unsqueeze(0), grid, mode="bilinear",
+                padding_mode="zeros", align_corners=True,
+            )
+            return warped[0]
+    return _Elastic(alpha, sigma)
 
 if __name__ == "__main__":
     main()
